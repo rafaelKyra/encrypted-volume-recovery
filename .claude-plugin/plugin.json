@@ -1,0 +1,14 @@
+{
+  "name": "encrypted-volume-recovery",
+  "displayName": "Encrypted volume recovery — headers, clones and hidden containers",
+  "version": "1.0.0",
+  "description": "Recover VeraCrypt, LUKS and hidden dm-crypt volumes without making things worse: a header sweep for volumes that cannot be recognised, a clone-first discipline with read-only gates, LUKS header recovery, and hidden-container offset detection. Every claim is marked as tested, reported or planned.",
+  "author": {
+    "name": "Rafael Kyra"
+  },
+  "license": "MIT",
+  "keywords": [
+    "encryption", "data-recovery", "veracrypt", "luks", "dm-crypt", "cryptsetup",
+    "zulucrypt", "forensics-safe", "linux", "ubuntu"
+  ]
+}

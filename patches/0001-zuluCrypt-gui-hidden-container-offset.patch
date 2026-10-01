@@ -1,0 +1,529 @@
+From: Rafael Kyra
+Subject: [PATCH] zuluCrypt-gui: detect the offset of hidden PLAIN containers, warn about
+ fragile cover files, validate size early, show the offset after creation
+
+This patch is a derivative work of zuluCrypt (c) 2011-2015 Francis Banyikwa and is
+licensed under the GNU General Public License, version 2 or (at your option) any
+later version, the same terms as the files it modifies. It is NOT covered by the MIT
+license of the rest of this repository.
+
+Touches only zuluCrypt-gui: createvolumeinexistingfile.cpp, password_dialog.cpp,
+password_dialog.h, password.ui. Apply from the root of the zuluCrypt source tree:
+
+    patch -p1 < 0001-zuluCrypt-gui-hidden-container-offset.patch
+
+---
+--- a/zuluCrypt-gui/createvolumeinexistingfile.cpp
++++ b/zuluCrypt-gui/createvolumeinexistingfile.cpp
+@@ -25,6 +25,10 @@
+ #include "dialogmsg.h"
+ 
+ #include <QFileDialog>
++#include <QFileInfo>
++#include <QStringList>
++#include <QApplication>
++#include <QClipboard>
+ 
+ struct Unit{
+ 	static const qint64 GB = 1024 * 1024 * 1024 ;
+@@ -199,6 +203,31 @@
+ 			m_ui->lineEditVolumeOffset->setText( m_volumeOffset.second ) ;
+ 
+ 			this->enableAll() ;
++
++			/*
++			 * The container is appended to the cover file. Formats that keep their
++			 * index at the front ignore trailing bytes and stay usable; formats that
++			 * keep it at the end are located by scanning back from EOF and become
++			 * unreadable once a container pushes that index out of reach.
++			 */
++			auto suffix = QFileInfo( e ).suffix().toLower() ;
++
++			static const QStringList indexAtEnd = { "zip","pdf","docx","xlsx","pptx",
++								"odt","ods","odp","jar","apk",
++								"epub","7z","whl" } ;
++
++			if( indexAtEnd.contains( suffix ) ){
++
++				DialogMsg( this ).ShowUIOK( tr( "Unsuitable Cover File" ),
++					tr( "A \".%1\" file keeps its index at the end of the file and "
++					    "programs find that index by scanning back from the end. "
++					    "Appending a container pushes it out of reach and the file "
++					    "stops opening.\n\n"
++					    "Pick a video, audio or image file instead, for example mp4, "
++					    "mkv, avi, mp3, jpg or png. Those keep their index at the "
++					    "front and stay fully usable with a container appended." )
++					.arg( suffix ) ) ;
++			}
+ 		}
+ 	} ) ;
+ 
+@@ -279,6 +308,19 @@
+ 		return DialogMsg( this ).ShowUIOK( tr( "ERROR" ),tr( "Illegal Character Found In The Container Size Field" ) ) ;
+ 	}
+ 
++	/*
++	 * The backend refuses anything up to 3MB, but only after the cover file has already
++	 * been grown with random data, which leaves the file bigger and nothing created.
++	 * Catch it here instead, while nothing has been written yet.
++	 */
++	if( containerSize <= 3 * 1024 * 1024 ){
++
++		return DialogMsg( this ).ShowUIOK( tr( "Container Too Small" ),
++			tr( "A container has to be bigger than 3 MB. Enter at least 4 and try again.\n\n"
++			    "Checked now rather than after the cover file has been enlarged, so "
++			    "nothing has been written to it yet." ) ) ;
++	}
++
+ 	auto status = volume.open() ;
+ 
+ 	if( status == createHiddenVolume::openStatus::FailedToOpenDevice ){
+@@ -311,6 +353,24 @@
+ 	if( volume.createVolume( key,volumePath,enc,offSet ) ){
+ 
+ 		m_ui->labelWarning->setText( tr( "Volume Created Successfully" ) ) ;
++
++		/*
++		 * A PLAIN dm-crypt volume has no header, so the offset and the encryption
++		 * option exist nowhere on disk. Without them the container cannot be opened
++		 * again, so make the user read them once instead of leaving them in a field
++		 * that closes with the dialog.
++		 */
++		QApplication::clipboard()->setText( offSet ) ;
++
++		DialogMsg( this ).ShowUIOK( tr( "Write These Down" ),
++			tr( "The container was created. To open it again you need all three of:\n\n"
++			    "    offset      %1\n"
++			    "    encryption  %2\n"
++			    "    password    the one you just typed\n\n"
++			    "A PLAIN dm-crypt volume has no header, so none of this is stored in "
++			    "the file. Lose any of the three and the data is gone for good.\n\n"
++			    "The offset has been copied to the clipboard." )
++			.arg( offSet,enc ) ) ;
+ 	}else{
+ 		m_ui->labelWarning->setText( tr( "Failed To Create A Volume" ) ) ;
+ 	}
+--- a/zuluCrypt-gui/password_dialog.cpp
++++ b/zuluCrypt-gui/password_dialog.cpp
+@@ -38,6 +38,11 @@
+ #include <QFileDialog>
+ #include <QStringList>
+ #include <QCloseEvent>
++#include <QDateTime>
++#include <QFileInfo>
++#include <QSet>
++#include <QVector>
++#include <QElapsedTimer>
+ #include <QTableWidget>
+ #include <stdlib.h>
+ 
+@@ -191,6 +196,10 @@
+ 		}
+ 	} ) ;
+ 
++	connect( m_ui->pbDetectOffset,&QPushButton::clicked,this,&passwordDialog::detectOffset ) ;
++
++	m_ui->pbDetectOffset->setVisible( false ) ;
++
+ 	m_ui->checkBoxVisibleKey->setToolTip( tr( "Check This Box To Make Password Visible" ) ) ;
+ 
+ 	this->setWindowTitle( tr( "Unlock Encrypted Volume" ) ) ;
+@@ -198,6 +207,306 @@
+ 	this->installEventFilter( this ) ;
+ }
+ 
++/*
++ * Offset auto-detection for PLAIN dm-crypt containers hidden inside a cover file.
++ *
++ * A container created by createVolumeInExistingFIle always satisfies two properties
++ * we can exploit to keep the search space small and bounded:
++ *
++ * 1. the requested container size is a whole number of MB, and the cover file is grown
++ *    in 1024 byte chunks, so  fileSize = offset + n*MB + r  with  0 <= r < 1024
++ *
++ * 2. the offset is the original cover file size rounded UP to a whole KB, MB or GB
++ *    depending on how big that file was, so the offset is always aligned to its tier
++ *
++ * Together these bound the candidate list at roughly 2000 entries no matter how big
++ * the cover file is. Candidates produced from container sizes people actually pick
++ * are probed first so the common case resolves in a couple of seconds.
++ */
++namespace{
++
++class offsetCandidates
++{
++public:
++	static QVector< qint64 > build( qint64 fileSize )
++	{
++		QVector< qint64 > out ;
++		QSet< qint64 > seen ;
++
++		auto tierAligned = []( qint64 off ){
++
++			if( off >= GB ){
++
++				return off % GB == 0 ;
++
++			}else if( off >= MB ){
++
++				return off % MB == 0 ;
++
++			}else if( off >= KB ){
++
++				return off % KB == 0 ;
++			}else{
++				return false ;
++			}
++		} ;
++
++		auto add = [ & ]( qint64 containerSizeMB ){
++
++			auto raw = fileSize - containerSizeMB * MB ;
++
++			if( raw <= 0 ){
++
++				return ;
++			}
++
++			auto off = ( raw / KB ) * KB ;
++
++			if( off <= 0 || !tierAligned( off ) || seen.contains( off ) ){
++
++				return ;
++			}
++
++			seen.insert( off ) ;
++			out.append( off ) ;
++		} ;
++
++		for( auto it : commonSizes() ){
++
++			add( it ) ;
++		}
++
++		auto maxC = fileSize / MB ;
++
++		for( qint64 c = 1 ; c <= maxC ; c++ ){
++
++			add( c ) ;
++		}
++
++		/*
++		 * The two loops above only reach offsets where "file size minus offset" is a
++		 * whole number of MB. That holds for a cover file written in one pass, but it
++		 * breaks for every container but the newest once containers are stacked, so
++		 * finish with the complete set of offsets the create dialog can ever produce:
++		 * the host size rounded up to its own KB, MB or GB tier.
++		 */
++		auto addOffset = [ & ]( qint64 off ){
++
++			if( off > 0 && off < fileSize && !seen.contains( off ) ){
++
++				seen.insert( off ) ;
++				out.append( off ) ;
++			}
++		} ;
++
++		for( qint64 k = 1 ; k <= 1024 ; k++ ){
++
++			addOffset( k * KB ) ;
++		}
++
++		for( qint64 k = 1 ; k <= 1024 ; k++ ){
++
++			addOffset( k * MB ) ;
++		}
++
++		for( qint64 k = 1 ; k * GB < fileSize ; k++ ){
++
++			addOffset( k * GB ) ;
++		}
++
++		return out ;
++	}
++private:
++	static const qint64 KB = 1024 ;
++	static const qint64 MB = 1024 * 1024 ;
++	static const qint64 GB = 1024 * 1024 * 1024 ;
++
++	static QVector< qint64 > commonSizes()
++	{
++		return { 1,2,4,5,8,10,16,20,25,32,40,50,64,75,100,128,150,200,250,256,300,400,500,512,
++			 750,1000,1024,1500,2000,2048,3000,4000,4096,5000,6000,8000,8192,10000,
++			 16000,16384,20000,25000,32000,32768,50000,51200,65536,100000,102400 } ;
++	}
++} ;
++
++}
++
++void passwordDialog::detectOffset()
++{
++	if( m_detecting ){
++
++		m_detectCancel = true ;
++		return ;
++	}
++
++	auto volumePath = m_ui->OpenVolumePath->text() ;
++
++	if( volumePath.isEmpty() ){
++
++		return m_label.show( tr( "Set a path to the cover file first" ) ) ;
++	}
++
++	QFileInfo fileInfo( volumePath ) ;
++
++	if( !fileInfo.isFile() ){
++
++		return m_label.show( tr( "Offset detection only works on a container hosted in a file" ) ) ;
++	}
++
++	auto key = m_ui->PassPhraseField->text() ;
++
++	if( key.isEmpty() ){
++
++		return m_label.show( tr( "Enter the volume password first, it is required to detect the offset" ) ) ;
++	}
++
++	auto candidates = offsetCandidates::build( fileInfo.size() ) ;
++
++	if( candidates.isEmpty() ){
++
++		return m_label.show( tr( "This file is too small to hold a hidden container" ) ) ;
++	}
++
++	auto cipher = m_plainDmCryptProperty ;
++
++	auto exePath = QString( ZULUCRYPTzuluCrypt ) ;
++
++	auto device = volumePath ;
++	device.replace( "\"","\"\"\"" ) ;
++
++	m_detecting    = true ;
++	m_detectCancel = false ;
++	m_detectDone   = 0 ;
++	m_detectTotal  = candidates.size() ;
++
++	this->disableAll() ;
++
++	m_ui->pbDetectOffset->setEnabled( true ) ;
++	m_ui->pbDetectOffset->setText( tr( "Stop" ) ) ;
++
++	auto progress = new QTimer( this ) ;
++
++	connect( progress,&QTimer::timeout,this,[ this ](){
++
++		auto done = m_detectDone.load() ;
++
++		m_label.show( tr( "Searching for the container ... %1 of %2 offsets tried" )
++			      .arg( QString::number( done ),QString::number( m_detectTotal ) ) ) ;
++	} ) ;
++
++	progress->start( 200 ) ;
++
++	qint64 found = -1 ;
++
++	bool alreadyOpen = false ;
++	bool mountPointBlocked = false ;
++
++	/*
++	 * A probe mount point left behind by a previous, interrupted search makes every
++	 * later probe fail with "could not create mount point". That error must never be
++	 * read as "wrong key", or a whole search silently reports nothing found. Use a
++	 * mount name unique to this run and stop with a real explanation if it still happens.
++	 */
++	auto probeName = "zuluCrypt-offset-probe-" +
++			 QString::number( QDateTime::currentMSecsSinceEpoch() % 1000000 ) ;
++
++	Task::await( [ & ](){
++
++		auto closeVolume = [ & ](){
++
++			auto close = QString( "%1 -q -d \"%2\"" ).arg( exePath,device ) ;
++
++			utility::Task::run( utility::appendUserUID( close ) ).await() ;
++		} ;
++
++		for( auto offset : candidates ){
++
++			if( m_detectCancel.load() ){
++
++				break ;
++			}
++
++			auto keyPath = utility::keyPath() ;
++
++			utility::keySend( keyPath,key ) ;
++
++			auto exe = QString( "%1 -o -d \"%2\" -m \"%3\" -e ro -t %4.%5b -f %6" )
++				   .arg( exePath,
++					 device,
++					 probeName,
++					 cipher,
++					 QString::number( offset ),
++					 keyPath ) ;
++
++			auto r = utility::Task::run( utility::appendUserUID( exe ) ).await() ;
++
++			m_detectDone += 1 ;
++
++			auto output = QString( r.stdOut() + r.stdError() ) ;
++
++			/*
++			 * Every probe would fail the same way if a mapper for this device is
++			 * already open, so say so instead of reporting a fruitless search.
++			 */
++			if( output.contains( "opened mapper" ) ){
++
++				alreadyOpen = true ;
++				break ;
++			}
++
++			if( output.contains( "mount point" ) ){
++
++				mountPointBlocked = true ;
++				break ;
++			}
++
++			if( r.success() ){
++
++				found = offset ;
++
++				closeVolume() ;
++
++				break ;
++			}
++		}
++	} ) ;
++
++	progress->stop() ;
++	progress->deleteLater() ;
++
++	m_detecting = false ;
++
++	m_ui->pbDetectOffset->setText( tr( "Detect" ) ) ;
++
++	this->enableAll() ;
++
++	if( found >= 0 ){
++
++		m_ui->lineEditVolumeProperty->setText( QString::number( found ) + "b" ) ;
++
++		m_label.show( tr( "Container found at offset %1 bytes. Write this number down, "
++				  "it cannot be recovered from the volume itself." )
++			      .arg( QString::number( found ) ) ) ;
++
++	}else if( alreadyOpen ){
++
++		m_label.show( tr( "This volume is already unlocked, close it before detecting the offset" ) ) ;
++
++	}else if( mountPointBlocked ){
++
++		m_label.show( tr( "Could not create a mount point to test with, so the search was "
++				  "stopped rather than wrongly reporting nothing found. Close any "
++				  "open volume and try again." ) ) ;
++
++	}else if( m_detectCancel.load() ){
++
++		m_label.show( tr( "Offset detection stopped" ) ) ;
++	}else{
++		m_label.show( tr( "No container found. The password or the encryption option "
++				  "may be wrong, or this file holds no hidden container." ) ) ;
++	}
++}
++
+ void passwordDialog::plainDmCryptOption( QAction * ac )
+ {
+ 	m_plainDmCryptProperty = ac->text().remove( "&" ) ;
+@@ -209,6 +518,8 @@
+ 
+ 	m_ui->lineEditVolumeProperty->setToolTip( QString() ) ;
+ 
++	m_ui->lineEditVolumeProperty->setPlaceholderText( QString() ) ;
++
+ 	if( e == 0 ){
+ 
+ 		/*
+@@ -244,9 +555,18 @@
+ 		m_ui->lineEditVolumeProperty->setToolTip( tr( "Offset Will Be In Sectors If The Entry Is Made Up Of Only Digits\nAnd In Bytes If The Entry Ends With \"b\"\nAnd In Kilobytes If The Entry Ends With \"k\"\nAnd In Megabytes If The Entry Ends With \"m\"\nAnd In Terabytes If The Entry Ends With \"t\"" ) ) ;
+ 		m_veraCryptVolume = false ;
+ 		m_ui->pushButtonLuksExternalHeaderPath->setEnabled( false ) ;
+-		m_ui->lineEditVolumeProperty->setEchoMode( QLineEdit::Password ) ;
++
++		/*
++		 * The offset is not a secret and masking it only makes this field
++		 * impossible to proof read, so show it and say what it wants.
++		 */
++		m_ui->lineEditVolumeProperty->setEchoMode( QLineEdit::Normal ) ;
++
++		m_ui->lineEditVolumeProperty->setPlaceholderText( tr( "eg 87040b, or click Detect" ) ) ;
+ 	}
+ 
++	m_ui->pbDetectOffset->setVisible( e == 3 ) ;
++
+ 	utility::defaultUnlockingVolumeType( e ) ;
+ }
+ 
+--- a/zuluCrypt-gui/password_dialog.h
++++ b/zuluCrypt-gui/password_dialog.h
+@@ -27,6 +27,7 @@
+ 
+ #include <functional>
+ #include <memory>
++#include <atomic>
+ 
+ #include "utility.h"
+ #include "secrets.h"
+@@ -66,6 +67,7 @@
+ 	void pbKeyOption() ;
+ 	void pbPluginEntryClicked( QAction * ) ;
+ 	void plainDmCryptOption( QAction * ) ;
++	void detectOffset() ;
+ 	void pbPlugin() ;
+ 	void mount_point() ;
+ 	void clickedPassPhraseFromFileButton() ;
+@@ -99,6 +101,10 @@
+ 	QString m_device ;
+ 	QString m_point ;
+ 	QString m_plainDmCryptProperty ;
++	std::atomic< bool > m_detectCancel{ false } ;
++	std::atomic< int > m_detectDone{ 0 } ;
++	int m_detectTotal = 0 ;
++	bool m_detecting = false ;
+ 	bool m_veraCryptVolume = false ;
+ 	utility::veraCryptWarning m_veraCryptWarning ;
+ 	bool m_working = false ;
+--- a/zuluCrypt-gui/password.ui
++++ b/zuluCrypt-gui/password.ui
+@@ -545,6 +545,23 @@
+     </property>
+    </widget>
+   </widget>
++  <widget class="QPushButton" name="pbDetectOffset">
++   <property name="geometry">
++    <rect>
++     <x>478</x>
++     <y>150</y>
++     <width>95</width>
++     <height>29</height>
++    </rect>
++   </property>
++   <property name="text">
++    <string>Detect</string>
++   </property>
++   <property name="toolTip">
++    <string>Automatically find the offset of a container hidden in this file.
++Enter the password first, then click Detect.</string>
++   </property>
++  </widget>
+  </widget>
+  <tabstops>
+   <tabstop>OpenVolumePath</tabstop>
+@@ -556,6 +573,7 @@
+   <tabstop>cbVolumeType</tabstop>
+   <tabstop>pushButtonPlainDmCryptOptions</tabstop>
+   <tabstop>lineEditVolumeProperty</tabstop>
++  <tabstop>pbDetectOffset</tabstop>
+   <tabstop>cbKeyType</tabstop>
+   <tabstop>checkBoxVisibleKey</tabstop>
+   <tabstop>PassPhraseField</tabstop>
